@@ -1,6 +1,7 @@
 """
 Database and Redis connection management
 """
+import logging
 import os
 from typing import AsyncGenerator
 
@@ -11,7 +12,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://stockuser:stockpass@localhost:5432/stockdb")
+logger = logging.getLogger("database")
+
+# Railway provides DATABASE_URL as postgresql://... — asyncpg needs postgresql+asyncpg://
+_raw_db_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://stockuser:stockpass@localhost:5432/stockdb")
+DATABASE_URL = (
+    _raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if _raw_db_url.startswith("postgresql://")
+    else _raw_db_url
+)
+
+# Upstash / Railway Redis — both TLS (rediss://) and plain (redis://) work
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 engine = create_async_engine(
@@ -62,9 +73,32 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db():
-    """Create tables if they don't exist (Alembic handles migrations in prod)"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Run schema SQL on first boot if tables don't exist yet."""
+    import asyncpg
+
+    raw_url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+    try:
+        conn = await asyncpg.connect(raw_url)
+        tables_exist = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='stocks')"
+        )
+        if not tables_exist:
+            schema_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "database", "supabase_schema.sql",
+            )
+            if os.path.exists(schema_path):
+                with open(schema_path) as f:
+                    sql = f.read()
+                await conn.execute(sql)
+                logger.info("✅ Database schema created from supabase_schema.sql")
+            else:
+                logger.warning("Schema file not found — skipping auto-migration")
+        else:
+            logger.info("✅ Database tables already exist — skipping migration")
+        await conn.close()
+    except Exception as e:
+        logger.error(f"Schema migration error: {e}")
 
 
 async def close_db():
