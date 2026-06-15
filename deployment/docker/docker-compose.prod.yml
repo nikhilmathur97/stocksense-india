@@ -1,0 +1,239 @@
+version: '3.9'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRODUCTION Docker Compose — Indian Stock Market Platform
+# Usage: docker compose -f deployment/docker/docker-compose.prod.yml up -d
+# ═══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── TimescaleDB ──────────────────────────────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: stockdb
+    restart: always
+    environment:
+      POSTGRES_DB:       ${DATABASE_NAME:-stockdb}
+      POSTGRES_USER:     ${DATABASE_USER:-stockuser}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      TIMESCALEDB_TELEMETRY: 'off'
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ../../database/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-stockuser} -d ${DATABASE_NAME:-stockdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - stocknet
+    # No external port exposure in prod — only internal network access
+    expose:
+      - "5432"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: stockredis
+    restart: always
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-}
+      --tcp-keepalive 60
+      --timeout 300
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - stocknet
+    expose:
+      - "6379"
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+        reservations:
+          memory: 128M
+
+  # ── FastAPI Backend ───────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+      args:
+        - ENVIRONMENT=production
+    image: stockplatform/backend:latest
+    container_name: stockbackend
+    restart: always
+    env_file:
+      - ../../.env.production
+    environment:
+      DATABASE_URL:  postgresql+asyncpg://${DATABASE_USER:-stockuser}:${DATABASE_PASSWORD}@timescaledb:5432/${DATABASE_NAME:-stockdb}
+      REDIS_URL:     redis://:${REDIS_PASSWORD:-}@redis:6379
+      ENVIRONMENT:   production
+      DEBUG:         "false"
+      BACKEND_WORKERS: ${BACKEND_WORKERS:-2}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://your-domain.com}
+    volumes:
+      - ../../engine:/app/engine:ro
+      - ../../pipeline:/app/pipeline:ro
+      - backend_logs:/app/logs
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - stocknet
+    expose:
+      - "8000"
+    # Production: gunicorn with uvicorn workers (no --reload)
+    command: >
+      gunicorn backend.main:app
+      -w ${BACKEND_WORKERS:-2}
+      -k uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --timeout 120
+      --keepalive 5
+      --max-requests 1000
+      --max-requests-jitter 100
+      --access-logfile -
+      --error-logfile -
+      --log-level info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # ── Next.js Frontend ──────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-https://your-domain.com/api}
+        - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-wss://your-domain.com/ws}
+        - NEXT_PUBLIC_APP_NAME=${NEXT_PUBLIC_APP_NAME:-StockSense India}
+    image: stockplatform/frontend:latest
+    container_name: stockfrontend
+    restart: always
+    environment:
+      NODE_ENV: production
+    networks:
+      - stocknet
+    expose:
+      - "3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ── Data Pipeline Scheduler ───────────────────────────────────────────────────
+  pipeline:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    image: stockplatform/backend:latest
+    container_name: stockpipeline
+    restart: always
+    env_file:
+      - ../../.env.production
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${DATABASE_USER:-stockuser}:${DATABASE_PASSWORD}@timescaledb:5432/${DATABASE_NAME:-stockdb}
+      REDIS_URL:    redis://:${REDIS_PASSWORD:-}@redis:6379
+      ENVIRONMENT:  production
+    volumes:
+      - ../../engine:/app/engine:ro
+      - ../../pipeline:/app/pipeline:ro
+      - pipeline_logs:/app/logs
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - stocknet
+    command: python pipeline/scheduler.py
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: stocknginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_ssl:/etc/nginx/ssl
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - stocknet
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  timescaledb_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_logs:
+    driver: local
+  pipeline_logs:
+    driver: local
+  nginx_ssl:
+    driver: local
+  nginx_logs:
+    driver: local
+
+networks:
+  stocknet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
