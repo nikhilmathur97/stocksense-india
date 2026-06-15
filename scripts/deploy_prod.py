@@ -4,9 +4,7 @@ Fully automated production deployment — StockSense India
 Provisions: Railway (PostgreSQL + Redis + FastAPI backend) + Vercel (Next.js)
 
 Usage:
-    python3 scripts/deploy_prod.py
-
-Only interaction required: one browser click to authorise Railway (OAuth).
+    RAILWAY_API_TOKEN=<token> python3 scripts/deploy_prod.py
 """
 import json
 import os
@@ -16,6 +14,16 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND = os.path.join(ROOT, "frontend")
+
+# ── Railway token (required) ──────────────────────────────────────────────────
+RAILWAY_TOKEN = os.environ.get("RAILWAY_API_TOKEN") or os.environ.get("RAILWAY_TOKEN") or ""
+if not RAILWAY_TOKEN:
+    print("\n❌ Missing Railway API token.")
+    print("   Get it from: https://railway.com/account/tokens → Create Token")
+    print("   Then run:")
+    print("   RAILWAY_API_TOKEN=your_token python3 scripts/deploy_prod.py\n")
+    sys.exit(1)
+os.environ["RAILWAY_API_TOKEN"] = RAILWAY_TOKEN
 
 ANGEL_ONE_API_KEY     = "F2BP8qON"
 ANGEL_ONE_CLIENT_CODE = "N61493142"
@@ -81,14 +89,14 @@ def main():
     print("  Backend:  Railway (PostgreSQL + Redis + FastAPI)")
     print()
 
-    # ── 0. Check Railway is installed ─────────────────────────────────────────
-    run("railway --version", check=True)
-
-    # ── 1. Railway login (opens browser — click Authorize) ────────────────────
-    step("Step 1/8 · Railway login")
-    print("  Opening Railway in your browser — click 'Authorize' when prompted.")
-    subprocess.run("railway login", shell=True, cwd=ROOT)
-    print("  ✅ Logged in to Railway")
+    # ── 0. Verify Railway token works ─────────────────────────────────────────
+    step("Step 1/8 · Verify Railway credentials")
+    result = run("railway whoami", check=False)
+    if "Unauthorized" in result or not result:
+        print("❌ Railway token is invalid or expired.")
+        print("   Get a fresh one: https://railway.com/account/tokens")
+        sys.exit(1)
+    print(f"  ✅ Authenticated as: {result}")
 
     # ── 2. Create Railway project ─────────────────────────────────────────────
     step("Step 2/8 · Create Railway project")
