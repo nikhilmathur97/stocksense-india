@@ -440,6 +440,63 @@ export const screenerApi = {
   backtestResults: () => api.get<Record<string, BacktestCalibration>>('/api/screener/backtest/results').then((r) => r.data),
 }
 
+// ── Paper Trades ──────────────────────────────────────────────────────────────
+
+export interface PaperTrade {
+  id: string
+  symbol: string
+  exchange: string
+  signal_type: string
+  category: string
+  probability_score: number
+  confirmed_count: number
+  entry_price: number
+  entry_time: string
+  target_3d: number | null
+  target_7d: number | null
+  stop_loss: number | null
+  estimated_hold_days: number
+  capital: number
+  quantity: number
+  status: 'OPEN' | 'WIN' | 'LOSS' | 'EXPIRED'
+  exit_price: number | null
+  exit_time: string | null
+  exit_reason: string | null
+  pnl_amount: number | null
+  pnl_pct: number | null
+  top_reasons: string[]
+  created_at: string
+}
+
+export interface PaperTradeSummary {
+  total: number
+  open_count: number
+  closed_count: number
+  wins: number
+  losses: number
+  win_rate: number | null
+  total_pnl: number | null
+  avg_pnl_pct: number | null
+  avg_win_pct: number | null
+  avg_loss_pct: number | null
+  avg_prob_wins: number | null
+  avg_prob_losses: number | null
+  by_category: Array<{
+    category: string
+    total: number
+    wins: number
+    losses: number
+    avg_pnl_pct: number | null
+  }>
+}
+
+export const paperTradesApi = {
+  list: (status?: string) =>
+    api.get<PaperTrade[]>('/api/paper-trades/', { params: status ? { status } : {} }).then((r) => r.data),
+  summary: () =>
+    api.get<PaperTradeSummary>('/api/paper-trades/summary').then((r) => r.data),
+}
+
 // ── News ──────────────────────────────────────────────────────────────────────
 
 export interface NewsItem {

@@ -289,6 +289,15 @@ async def run_screener(
             # Invalidate caches
             await redis.delete("screener:top_picks")
 
+            # Auto-enter paper trades for qualifying new signals
+            try:
+                from backend.routers.paper_trades import auto_enter_paper_trades as _apt
+                entered = await _apt(results, db)
+                if entered:
+                    logger.info(f"📊 Manual screener: {entered} paper trade(s) auto-opened")
+            except Exception as _pe:
+                logger.warning(f"Paper trade auto-entry skipped: {_pe}")
+
         return {"message": f"Screener completed: {len(results)} signals saved to DB", "count": len(results)}
     except Exception as e:
         await db.rollback()

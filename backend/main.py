@@ -16,8 +16,10 @@ from slowapi.util import get_remote_address
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from sqlalchemy import text as _text
 from backend.database import init_db, close_db, get_redis
 from backend.routers import stocks, options, screener, websocket, ai_analysis
+from backend.routers import paper_trades as paper_trades_router
 from backend.routers import news as news_router
 from backend.routers import option_suggestions
 from backend.routers import backtest as backtest_router
@@ -48,6 +50,17 @@ async def lifespan(app: FastAPI):
             await init_db()
             await get_redis()
             logger.info("DB and Redis connections established")
+
+            # Ensure paper_trades table exists
+            try:
+                from backend.database import get_db as _get_db
+                from backend.routers.paper_trades import ensure_table as _ensure_pt
+                async for _db in _get_db():
+                    await _ensure_pt(_db)
+                    break
+                logger.info("✅ Paper trades table ready")
+            except Exception as _pt_err:
+                logger.warning(f"Paper trades table init failed: {_pt_err}")
         except Exception as e:
             logger.error(f"DB/Redis init error: {e}")
 
@@ -167,14 +180,103 @@ async def lifespan(app: FastAPI):
 
                 async def _run_once():
                     try:
+                        import json as _json
+                        from decimal import Decimal as _Decimal
                         from engine.screener import run_screener as _run_screener
+                        from backend.database import get_db as _get_db
+                        from backend.routers.paper_trades import auto_enter_paper_trades as _auto_pt
+
                         results = await _run_screener()
                         high_conf = [r for r in results if r.get("probability_score", 0) >= 80]
+
+                        # Persist signals to DB (same as manual /run endpoint)
+                        if results:
+                            async for _db in _get_db():
+                                try:
+                                    await _db.execute(_text(
+                                        "UPDATE stock_signals SET is_active = FALSE"
+                                    ))
+                                    for s in results:
+                                        await _db.execute(_text("""
+                                            INSERT INTO stock_signals (
+                                                symbol, exchange, signal_type, timeframe,
+                                                probability_score, probability_3d,
+                                                probability_7d, probability_15d,
+                                                entry_price, target_3d, target_7d,
+                                                target_15d, stop_loss,
+                                                expected_return_3d, expected_return_7d,
+                                                expected_return_15d, risk_reward_ratio,
+                                                estimated_hold_days, confidence, category,
+                                                top_reasons, risks,
+                                                technical_score, volume_score,
+                                                price_action_score, options_score,
+                                                reasoning, confirmation_checks,
+                                                confirmed_count, buy_confirmed,
+                                                is_active, created_at
+                                            ) VALUES (
+                                                :symbol, :exchange, :signal_type, :timeframe,
+                                                :probability_score, :probability_3d,
+                                                :probability_7d, :probability_15d,
+                                                :entry_price, :target_3d, :target_7d,
+                                                :target_15d, :stop_loss,
+                                                :expected_return_3d, :expected_return_7d,
+                                                :expected_return_15d, :risk_reward_ratio,
+                                                :estimated_hold_days, :confidence, :category,
+                                                :top_reasons, :risks,
+                                                :technical_score, :volume_score,
+                                                :price_action_score, :options_score,
+                                                :reasoning, :confirmation_checks,
+                                                :confirmed_count, :buy_confirmed,
+                                                TRUE, NOW()
+                                            )
+                                        """), {
+                                            "symbol": s.get("symbol"),
+                                            "exchange": s.get("exchange"),
+                                            "signal_type": s.get("signal_type"),
+                                            "timeframe": s.get("timeframe", "1d"),
+                                            "probability_score": s.get("probability_score"),
+                                            "probability_3d": s.get("probability_3d"),
+                                            "probability_7d": s.get("probability_7d"),
+                                            "probability_15d": s.get("probability_15d"),
+                                            "entry_price": s.get("entry_price"),
+                                            "target_3d": s.get("target_3d"),
+                                            "target_7d": s.get("target_7d"),
+                                            "target_15d": s.get("target_15d"),
+                                            "stop_loss": s.get("stop_loss"),
+                                            "expected_return_3d": s.get("expected_return_3d"),
+                                            "expected_return_7d": s.get("expected_return_7d"),
+                                            "expected_return_15d": s.get("expected_return_15d"),
+                                            "risk_reward_ratio": s.get("risk_reward_ratio"),
+                                            "estimated_hold_days": s.get("estimated_hold_days", 5),
+                                            "confidence": s.get("confidence"),
+                                            "category": s.get("category"),
+                                            "top_reasons": _json.dumps(s.get("top_reasons") or []),
+                                            "risks": _json.dumps(s.get("risks") or []),
+                                            "technical_score": s.get("technical_score"),
+                                            "volume_score": s.get("volume_score"),
+                                            "price_action_score": s.get("price_action_score"),
+                                            "options_score": s.get("options_score"),
+                                            "reasoning": s.get("reasoning"),
+                                            "confirmation_checks": _json.dumps(
+                                                s.get("confirmation_checks") or {}
+                                            ),
+                                            "confirmed_count": s.get("confirmed_count", 0),
+                                            "buy_confirmed": bool(s.get("buy_confirmed", False)),
+                                        })
+                                    await _db.commit()
+
+                                    # Auto-enter paper trades for qualifying signals
+                                    entered = await _auto_pt(results, _db)
+                                    if entered:
+                                        logger.info(f"📊 Auto paper trades: {entered} new position(s) opened")
+                                except Exception as _db_err:
+                                    logger.error(f"Auto-screener DB save error: {_db_err}")
+                                break
+
                         logger.info(
                             f"✅ Auto-screener done: {len(results)} signals, "
                             f"{len(high_conf)} HIGH confidence (≥80%)"
                         )
-                        # Invalidate top-picks cache so next request gets fresh data
                         redis_client = await get_redis()
                         await redis_client.delete("screener:top_picks")
                         await redis_client.delete("screener:results")
@@ -237,18 +339,46 @@ async def lifespan(app: FastAPI):
                         logger.debug(f"News loop error: {_ne}")
                     await _asyncio.sleep(60)
 
+            # Paper trade price monitor — checks open trades every 5 min during market hours
+            async def _paper_trade_monitor():
+                import asyncio as _asyncio
+                from datetime import datetime as _dt, timedelta as _td, timezone as _tz, time as _time
+                from backend.database import get_db as _get_db
+                from backend.routers.paper_trades import monitor_open_trades as _monitor
+                _IST = _td(hours=5, minutes=30)
+                _OPEN  = _time(9, 15)
+                _CLOSE = _time(15, 35)
+                await _asyncio.sleep(30)   # let DB settle before first check
+                while True:
+                    now_ist = (_dt.now(_tz.utc) + _IST).time()
+                    is_mkt = _OPEN <= now_ist <= _CLOSE
+                    if is_mkt:
+                        try:
+                            _rc = await get_redis()
+                            async for _db in _get_db():
+                                closed = await _monitor(_db, _rc)
+                                if closed:
+                                    logger.info(f"📊 Paper trade monitor: {closed} trade(s) closed")
+                                break
+                        except Exception as _me:
+                            logger.error(f"Paper trade monitor error: {_me}")
+                    await _asyncio.sleep(300)   # every 5 minutes
+
             import asyncio as _asyncio
             _asyncio.ensure_future(_poll_quotes())
             _asyncio.ensure_future(_auto_screener())
             _asyncio.ensure_future(_news_loop())
+            _asyncio.ensure_future(_paper_trade_monitor())
             logger.info("Quote poll loop started — FULL mode, 2s interval, publishes to live:ticks")
             logger.info("Auto-screener started — runs every 1 min during market hours (9:15–15:30 IST)")
             logger.info("News loop started — fetches from 8 sources every 60 s, 24/7")
+            logger.info("Paper trade monitor started — checks open trades every 5 min during market hours")
 
             # Start Alert Engine — monitors live quotes and fires alerts
             try:
                 from backend.services.alert_engine import AlertEngine, set_alert_engine
-                alert_engine = AlertEngine(redis)
+                _redis_for_alerts = await get_redis()
+                alert_engine = AlertEngine(_redis_for_alerts)
                 set_alert_engine(alert_engine)
                 await alert_engine.start()
                 logger.info("✅ Alert engine started — monitoring RSI, volume, patterns, MACD, Supertrend")
@@ -319,6 +449,7 @@ app.include_router(alerts_router.router)
 app.include_router(market_stocks_router)
 app.include_router(market_options_router)
 app.include_router(trades_router)
+app.include_router(paper_trades_router.router)
 
 
 # ── Health Check ──────────────────────────────────────────────────────────────

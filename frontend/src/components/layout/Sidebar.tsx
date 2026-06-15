@@ -5,7 +5,7 @@ import { usePathname } from 'next/navigation'
 import {
   BarChart2, TrendingUp, LineChart, Bell, BookOpen, Settings,
   Activity, Menu, Newspaper, Zap, FlaskConical, LayoutGrid,
-  Clock, Layers, PieChart
+  Clock, Layers, PieChart, TestTube2
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useUIStore } from '@/store'
@@ -13,6 +13,7 @@ import { useUIStore } from '@/store'
 const navItems = [
   { href: '/',                  label: 'Dashboard',       icon: BarChart2 },
   { href: '/screener',          label: 'AI Screener',     icon: TrendingUp },
+  { href: '/paper-trades',      label: 'Paper Trades',    icon: TestTube2 },
   { href: '/news',              label: 'Market News',     icon: Newspaper },
   { href: '/sectors',           label: 'Sector Heatmap',  icon: LayoutGrid },
   { href: '/market-breadth',    label: 'Market Breadth',  icon: Activity },
