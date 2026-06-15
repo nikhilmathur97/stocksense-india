@@ -24,7 +24,8 @@ export default function ScreenerPage() {
       screenerApi.signals({
         min_probability: filters.minProbability,
         signal_type: filters.signalType || undefined,
-        confidence: filters.confidence || undefined,
+        category: filters.category || undefined,
+        sort_by: filters.sortBy || 'probability_score',
         limit: 100,
       }),
     refetchInterval: REFETCH_INTERVAL_MS,

@@ -28,8 +28,8 @@ interface ScreenerState {
   filters: {
     minProbability: number
     signalType: string
-    confidence: string
-    sector: string
+    category: string
+    sortBy: string
   }
   setSignals: (signals: StockSignal[]) => void
   setFilter: (key: string, value: string | number) => void
@@ -39,8 +39,8 @@ interface ScreenerState {
 const defaultFilters = {
   minProbability: 60,
   signalType: '',
-  confidence: '',
-  sector: '',
+  category: '',
+  sortBy: 'probability_score',
 }
 
 export const useScreenerStore = create<ScreenerState>()((set) => ({

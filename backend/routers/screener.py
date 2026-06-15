@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from backend.database import get_db, get_redis
 from backend.schemas import (
-    StockSignalOut, ScreenerFilters,
+    StockSignalOut,
     WatchlistCreate, WatchlistOut, WatchlistUpdate,
     AlertCreate, AlertOut,
 )
@@ -44,101 +44,92 @@ router = APIRouter(prefix="/api/screener", tags=["Screener"])
 
 async def _overlay_live_prices(signals: list, redis, db: "AsyncSession | None" = None) -> list:
     """
-    For each signal dict, look up the live LTP and overlay it onto
-    entry_price, target_7d, target_15d, stop_loss.
-    Also adds live_ltp, price_change_pct, price_updated_at fields.
-
-    Priority:
-      1. Redis cache (quote:EXCHANGE:SYMBOL) — populated by WebSocket feed
-      2. Angel One live quote via data_fetcher (non-blocking, 3s timeout)
-      3. DB OHLCV fallback — last 2 rows from ohlcv_daily (always available)
+    Overlay live prices onto signals.  Fast path:
+      1. Redis pipeline MGET for all symbols at once (< 5ms for 200 signals)
+      2. Single SQL query for any misses (all at once, not per-signal)
+    Angel One per-signal calls are intentionally omitted — they add 3s × N latency.
     """
+    if not signals:
+        return signals
+
+    syms = [(s.get("symbol", ""), s.get("exchange", "NSE")) for s in signals]
+
+    # ── 1. Redis pipeline — one round-trip for all symbols ────────────────────
+    redis_hits: dict[tuple, dict] = {}
+    try:
+        pipe = redis.pipeline()
+        for sym, exch in syms:
+            pipe.get(f"quote:{exch}:{sym}")
+        results = await pipe.execute()
+        for (sym, exch), raw in zip(syms, results):
+            if raw:
+                try:
+                    q = json.loads(raw)
+                    if float(q.get("ltp", 0) or 0) > 0:
+                        redis_hits[(sym, exch)] = q
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # ── 2. DB batch fallback for misses (latest 2 rows per symbol) ───────────
+    db_prices: dict[tuple, tuple] = {}
+    db_prev: dict[tuple, float] = {}
+    misses = [(sym, exch) for sym, exch in syms if (sym, exch) not in redis_hits]
+    if misses and db is not None:
+        try:
+            miss_syms = list({sym for sym, _ in misses})
+            rows = await db.execute(
+                text("""
+                SELECT symbol, exchange, close, date FROM (
+                    SELECT symbol, exchange, close, date,
+                           ROW_NUMBER() OVER (PARTITION BY symbol, exchange ORDER BY date DESC) AS rn
+                    FROM ohlcv_daily
+                    WHERE symbol = ANY(:syms)
+                ) t WHERE rn <= 2
+                ORDER BY symbol, exchange, rn
+                """),
+                {"syms": miss_syms},
+            )
+            from collections import defaultdict
+            grouped: dict = defaultdict(list)
+            for row in rows.fetchall():
+                grouped[(row[0], row[1])].append((float(row[2]), str(row[3])))
+            for key, vals in grouped.items():
+                if vals:
+                    db_prices[key] = (vals[0][0], vals[0][1])
+                if len(vals) >= 2:
+                    db_prev[key] = vals[1][0]
+        except Exception:
+            pass
+
+    # ── Apply overlay ─────────────────────────────────────────────────────────
     for s in signals:
-        sym = s.get("symbol", "")
-        exchange = s.get("exchange", "NSE")
+        sym, exch = s.get("symbol", ""), s.get("exchange", "NSE")
         live_ltp: float = 0.0
         change_pct: float = 0.0
         price_ts: str = ""
 
-        # ── 1. Redis cache ────────────────────────────────────────────────────
-        for key in [f"quote:{exchange}:{sym}", f"quote:NSE:{sym}", f"quote:{sym}"]:
-            raw = await redis.get(key)
-            if raw:
-                try:
-                    q = json.loads(raw)
-                    ltp_val = float(q.get("ltp", 0) or 0)
-                    if ltp_val > 0:
-                        live_ltp = ltp_val
-                        change_pct = round(float(q.get("change_pct", 0) or 0), 2)
-                        price_ts = q.get("timestamp", "")
-                        break
-                except Exception:
-                    pass
+        if (sym, exch) in redis_hits:
+            q = redis_hits[(sym, exch)]
+            live_ltp = float(q.get("ltp", 0) or 0)
+            change_pct = round(float(q.get("change_pct", 0) or 0), 2)
+            price_ts = q.get("timestamp", "")
+        elif (sym, exch) in db_prices:
+            live_ltp, price_ts = db_prices[(sym, exch)]
+            prev = db_prev.get((sym, exch), live_ltp)
+            change_pct = round((live_ltp - prev) / prev * 100, 2) if prev > 0 else 0.0
 
-        # ── 2. Angel One live quote (fast, non-blocking) ──────────────────────
-        if live_ltp == 0:
-            try:
-                import asyncio
-                from concurrent.futures import ThreadPoolExecutor
-                from backend.data_fetcher import get_live_quote as _get_live_quote
-
-                loop = asyncio.get_event_loop()
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    quote = await asyncio.wait_for(
-                        loop.run_in_executor(pool, _get_live_quote, sym, exchange),
-                        timeout=3.0,
-                    )
-                if quote and float(quote.get("ltp", 0) or 0) > 0:
-                    live_ltp = float(quote["ltp"])
-                    change_pct = round(float(quote.get("change_pct", 0) or 0), 2)
-                    price_ts = quote.get("timestamp", "")
-                    # Cache in Redis for 15s so subsequent calls are instant
-                    cache_key = f"quote:{exchange}:{sym}"
-                    await redis.setex(cache_key, 15, json.dumps(quote))
-            except Exception:
-                pass
-
-        # ── 3. DB OHLCV fallback ──────────────────────────────────────────────
-        if live_ltp == 0 and db is not None:
-            try:
-                rows = await db.execute(
-                    text("""
-                    SELECT close, date
-                    FROM ohlcv_daily
-                    WHERE symbol = :sym AND exchange = :exch
-                    ORDER BY date DESC LIMIT 2
-                    """),
-                    {"sym": sym, "exch": exchange},
-                )
-                ohlcv_rows = rows.fetchall()
-                if ohlcv_rows:
-                    latest_close = float(ohlcv_rows[0][0])
-                    prev_close = float(ohlcv_rows[1][0]) if len(ohlcv_rows) > 1 else latest_close
-                    if latest_close > 0:
-                        live_ltp = latest_close
-                        change_pct = round((latest_close - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0.0
-                        price_ts = str(ohlcv_rows[0][1])
-            except Exception:
-                pass
-
-        # ── Apply overlay ─────────────────────────────────────────────────────
         if live_ltp > 0:
             stored_entry = float(s.get("entry_price") or 0)
             if stored_entry > 0 and abs(live_ltp - stored_entry) / stored_entry > 0.001:
-                # Price has moved since signal was generated — rescale targets/SL
                 ratio = live_ltp / stored_entry
                 s["entry_price"] = round(live_ltp, 2)
-                if s.get("target_3d"):
-                    s["target_3d"] = round(float(s["target_3d"]) * ratio, 2)
-                if s.get("target_7d"):
-                    s["target_7d"] = round(float(s["target_7d"]) * ratio, 2)
-                if s.get("target_15d"):
-                    s["target_15d"] = round(float(s["target_15d"]) * ratio, 2)
-                if s.get("stop_loss"):
-                    s["stop_loss"] = round(float(s["stop_loss"]) * ratio, 2)
+                for field in ("target_3d", "target_7d", "target_15d", "stop_loss"):
+                    if s.get(field):
+                        s[field] = round(float(s[field]) * ratio, 2)
             elif stored_entry == 0:
                 s["entry_price"] = round(live_ltp, 2)
-
             s["live_ltp"] = live_ltp
             s["price_change_pct"] = change_pct
             s["price_updated_at"] = price_ts
@@ -152,8 +143,8 @@ async def _overlay_live_prices(signals: list, redis, db: "AsyncSession | None" =
 async def get_signals(
     min_probability: float = Query(default=60.0),
     signal_type: Optional[str] = Query(default=None),
-    sector: Optional[str] = Query(default=None),
-    confidence: Optional[str] = Query(default=None),
+    category: Optional[str] = Query(default=None),
+    sort_by: str = Query(default="probability_score"),
     limit: int = Query(default=50, le=200),
     redis=Depends(get_redis),
     db: AsyncSession = Depends(get_db),
@@ -204,8 +195,17 @@ async def get_signals(
         filtered = [s for s in filtered if (s.get("probability_score") or 0) >= min_probability]
     if signal_type:
         filtered = [s for s in filtered if s.get("signal_type") == signal_type.upper()]
-    if confidence:
-        filtered = [s for s in filtered if s.get("confidence") == confidence.upper()]
+    if category:
+        cat_lower = category.lower()
+        filtered = [s for s in filtered if cat_lower in (s.get("category") or "").lower()]
+
+    # Sort before limiting
+    _sort_keys = {
+        "expected_return_7d": lambda s: float(s.get("expected_return_7d") or 0),
+        "risk_reward_ratio":  lambda s: float(s.get("risk_reward_ratio") or 0),
+    }
+    key_fn = _sort_keys.get(sort_by, lambda s: float(s.get("probability_score") or 0))
+    filtered.sort(key=key_fn, reverse=True)
 
     return filtered[:limit]
 

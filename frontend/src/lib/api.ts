@@ -431,7 +431,7 @@ export const backtestApi = {
 }
 
 export const screenerApi = {
-  signals: (params?: { min_probability?: number; signal_type?: string; confidence?: string; limit?: number }) =>
+  signals: (params?: { min_probability?: number; signal_type?: string; category?: string; sort_by?: string; limit?: number }) =>
     api.get<StockSignal[]>('/api/screener/signals', { params }).then((r) => r.data),
   topPicks: () => api.get<StockSignal[]>('/api/screener/top-picks').then((r) => r.data),
   // Screener run can take 30–60 s — use a dedicated long-timeout request
