@@ -10,13 +10,10 @@ on:
         required: false
         default: 'all'
         type: choice
-        options: [all, backend, frontend]
+        options: [all, frontend]
 
 env:
-  # Non-secret project IDs — safe to commit
-  RAILWAY_PROJECT_ID: 8877d5e4-9029-41ef-a242-d9489569fba4
-  RAILWAY_SERVICE_ID: 00bf1942-eeeb-44b0-b7e9-5ac3ed5b99aa
-  RAILWAY_ENVIRONMENT_ID: b71af091-c9a8-464f-b362-e61cf051be34
+  # Non-secret project identifiers — safe to commit
   VERCEL_ORG_ID: team_KHLA60LqPLQzMO93fpdeNGmb
   VERCEL_PROJECT_ID: prj_GeH3IdZ3KiQW8RmbR0IGMCuEfj28
   BACKEND_URL: https://backend-production-4344.up.railway.app
@@ -44,42 +41,29 @@ jobs:
             frontend:
               - 'frontend/**'
 
-  # ── Deploy backend to Railway ─────────────────────────────────────────────────
-  deploy-backend:
+  # ── Backend: Railway auto-deploys via GitHub integration ──────────────────────
+  # Railway is connected to this repo and rebuilds automatically on push to main.
+  # This job just waits until the Railway-triggered build is healthy.
+  verify-backend:
     needs: changes
-    if: |
-      needs.changes.outputs.backend == 'true' ||
-      github.event.inputs.service == 'backend' ||
-      github.event.inputs.service == 'all'
+    if: needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli@latest
-
-      - name: Deploy & wait for healthy
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      - name: Wait for Railway build + health check
         run: |
-          railway up \
-            --project $RAILWAY_PROJECT_ID \
-            --service $RAILWAY_SERVICE_ID \
-            --environment $RAILWAY_ENVIRONMENT_ID \
-            --detach
-          echo "Build triggered — polling health endpoint..."
-          sleep 90
-          for i in $(seq 1 12); do
+          echo "Railway build triggered automatically by push. Polling health..."
+          sleep 120
+          for i in $(seq 1 15); do
             STATUS=$(curl -sf $BACKEND_URL/health \
               | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
             if [ "$STATUS" = "ok" ]; then
               echo "✓ Backend healthy (attempt $i)"
               exit 0
             fi
-            echo "  attempt $i: $STATUS — retrying in 15s"
-            sleep 15
+            echo "  attempt $i: waiting... retrying in 20s"
+            sleep 20
           done
-          echo "Backend did not become healthy within 3 minutes"
+          echo "Backend did not become healthy within 5 minutes"
           exit 1
 
   # ── Deploy frontend to Vercel ─────────────────────────────────────────────────
