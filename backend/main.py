@@ -40,17 +40,26 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up Indian Stock Market Platform...")
-    await init_db()
-    redis = await get_redis()
-    logger.info("DB and Redis connections established")
 
-    # Initialize Angel One session
-    try:
-        from backend.data_fetcher import initialize
-        initialize()
-        logger.info("Angel One session initialized")
-    except Exception as e:
-        logger.warning(f"Angel One init skipped (no credentials): {e}")
+    # Run heavy startup (DB migration, Angel One) in a background task so
+    # /health responds immediately and Railway's health check passes.
+    async def _startup_tasks():
+        try:
+            await init_db()
+            await get_redis()
+            logger.info("DB and Redis connections established")
+        except Exception as e:
+            logger.error(f"DB/Redis init error: {e}")
+
+        try:
+            from backend.data_fetcher import initialize
+            initialize()
+            logger.info("Angel One session initialized")
+        except Exception as e:
+            logger.warning(f"Angel One init skipped: {e}")
+
+    import asyncio as _asyncio
+    _asyncio.create_task(_startup_tasks())
 
     # Start Angel One WebSocket live feed — subscribe to all active stocks
     try:

@@ -4,5 +4,5 @@ dockerfilePath = "Dockerfile.railway"
 
 [deploy]
 healthcheckPath = "/health"
-healthcheckTimeout = 30
-startCommand = "gunicorn backend.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:${PORT:-8000} --timeout 120"
+healthcheckTimeout = 120
+startCommand = "gunicorn backend.main:app -k uvicorn.workers.UvicornWorker -w 1 --bind 0.0.0.0:${PORT:-8000} --timeout 180"
