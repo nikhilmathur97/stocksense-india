@@ -5,5 +5,4 @@ dockerfilePath = "Dockerfile.railway"
 [deploy]
 healthcheckPath = "/health"
 healthcheckTimeout = 30
-restartPolicyType = "on-failure"
-restartPolicyMaxRetries = 3
+startCommand = "gunicorn backend.main:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:${PORT:-8000} --timeout 120"
