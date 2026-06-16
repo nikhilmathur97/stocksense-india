@@ -190,9 +190,13 @@ async def get_signals(
     await _overlay_backtest(signals, redis)
 
     # Apply filters in-memory
+    # Use the same probability field the card displays: probability_7d if present, else probability_score
+    def _display_prob(s: dict) -> float:
+        return float(s.get("probability_7d") or s.get("probability_score") or 0)
+
     filtered = signals
     if min_probability:
-        filtered = [s for s in filtered if (s.get("probability_score") or 0) >= min_probability]
+        filtered = [s for s in filtered if _display_prob(s) >= min_probability]
     if signal_type:
         filtered = [s for s in filtered if s.get("signal_type") == signal_type.upper()]
     if category:
@@ -204,7 +208,7 @@ async def get_signals(
         "expected_return_7d": lambda s: float(s.get("expected_return_7d") or 0),
         "risk_reward_ratio":  lambda s: float(s.get("risk_reward_ratio") or 0),
     }
-    key_fn = _sort_keys.get(sort_by, lambda s: float(s.get("probability_score") or 0))
+    key_fn = _sort_keys.get(sort_by, _display_prob)
     filtered.sort(key=key_fn, reverse=True)
 
     return filtered[:limit]
