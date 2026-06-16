@@ -189,13 +189,16 @@ async def get_signals(
     signals = await _overlay_live_prices(signals, redis, db)
     await _overlay_backtest(signals, redis)
 
-    # Apply filters in-memory
-    # Use the same probability field the card displays: probability_7d if present, else probability_score
+    # Apply filters in-memory.
+    # IMPORTANT: filter uses the same field SignalCard displays (probability_7d ?? probability_score)
+    # so what the user sees on the card is exactly what the filter applies.
     def _display_prob(s: dict) -> float:
-        return float(s.get("probability_7d") or s.get("probability_score") or 0)
+        p7 = s.get("probability_7d")
+        ps = s.get("probability_score")
+        return float(p7 if (p7 is not None and p7 > 0) else (ps or 0))
 
     filtered = signals
-    if min_probability:
+    if min_probability and min_probability > 0:
         filtered = [s for s in filtered if _display_prob(s) >= min_probability]
     if signal_type:
         filtered = [s for s in filtered if s.get("signal_type") == signal_type.upper()]
