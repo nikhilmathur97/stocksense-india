@@ -189,141 +189,152 @@ export function StockChart({ symbol, signal }: Props) {
   useEffect(() => {
     if (!mainRef.current || !rsiRef.current || !macdRef.current) return
 
-    // ── Main chart ──
-    const mc = createChart(mainRef.current, {
-      ...baseChartOpts(false),
-      rightPriceScale: {
-        borderColor:  'rgba(255,255,255,0.06)',
-        scaleMargins: { top: 0.06, bottom: 0.20 },
-      },
-    })
+    let cleanup: (() => void) | undefined
 
-    const cs = mc.addCandlestickSeries({
-      upColor: '#22c55e', downColor: '#ef4444',
-      borderUpColor: '#22c55e', borderDownColor: '#ef4444',
-      wickUpColor:   '#22c55e', wickDownColor:   '#ef4444',
-      autoscaleInfoProvider: (original: () => AutoscaleInfo | null) => {
-        try {
-          const base = original()
-          const sig  = signalRef.current
-          if (!sig) return base
-          const prices = [sig.stop_loss, sig.entry_price, sig.target_3d, sig.target_7d]
-            .filter((p): p is number => typeof p === 'number' && p > 0)
-          if (!prices.length) return base
-          const mn = Math.min(...prices), mx = Math.max(...prices)
-          // base may be null (empty series) or have a null priceRange
-          if (!base || !base.priceRange) {
-            return { priceRange: { minValue: mn, maxValue: mx }, margins: { above: 0.1, below: 0.1 } }
+    try {
+      // ── Main chart ──
+      const mc = createChart(mainRef.current, {
+        ...baseChartOpts(false),
+        rightPriceScale: {
+          borderColor:  'rgba(255,255,255,0.06)',
+          scaleMargins: { top: 0.06, bottom: 0.20 },
+        },
+      })
+
+      const cs = mc.addCandlestickSeries({
+        upColor: '#22c55e', downColor: '#ef4444',
+        borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+        wickUpColor:   '#22c55e', wickDownColor:   '#ef4444',
+        autoscaleInfoProvider: (original: () => AutoscaleInfo | null) => {
+          try {
+            const base = original()
+            const sig  = signalRef.current
+            if (!sig) return base
+            const prices = [sig.stop_loss, sig.entry_price, sig.target_3d, sig.target_7d]
+              .filter((p): p is number => typeof p === 'number' && p > 0)
+            if (!prices.length) return base
+            const mn = Math.min(...prices), mx = Math.max(...prices)
+            if (!base || !base.priceRange) {
+              return { priceRange: { minValue: mn, maxValue: mx }, margins: { above: 0.1, below: 0.1 } }
+            }
+            return {
+              priceRange: {
+                minValue: Math.min(base.priceRange.minValue, mn),
+                maxValue: Math.max(base.priceRange.maxValue, mx),
+              },
+              margins: base.margins,
+            }
+          } catch {
+            return null
           }
-          return {
-            priceRange: {
-              minValue: Math.min(base.priceRange.minValue, mn),
-              maxValue: Math.max(base.priceRange.maxValue, mx),
-            },
-            margins: base.margins,
-          }
-        } catch {
-          return null
+        },
+      })
+
+      const vs = mc.addHistogramSeries({
+        color: '#60a5fa', priceFormat: { type: 'volume' }, priceScaleId: 'vol',
+      })
+      mc.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
+
+      const e21 = mc.addLineSeries({ color: '#f97316', lineWidth: 1, title: 'EMA21', priceLineVisible: false, lastValueVisible: true  })
+      const e50 = mc.addLineSeries({ color: '#a855f7', lineWidth: 1, title: 'EMA50', priceLineVisible: false, lastValueVisible: true  })
+
+      // ── RSI chart ──
+      const rc = createChart(rsiRef.current, {
+        ...baseChartOpts(false),
+        rightPriceScale: {
+          borderColor:  'rgba(255,255,255,0.06)',
+          scaleMargins: { top: 0.1, bottom: 0.1 },
+          minimumWidth: 60,
+        },
+      })
+      const rsiS = rc.addLineSeries({ color: '#60a5fa', lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
+      ;[{ p: 70, c: '#ef4444', t: 'OB' }, { p: 50, c: '#475569', t: '' }, { p: 30, c: '#22c55e', t: 'OS' }]
+        .forEach(({ p, c, t }) =>
+          rsiS.createPriceLine({ price: p, color: c, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: !!t, title: t })
+        )
+
+      // ── MACD chart ──
+      const macdChart_ = createChart(macdRef.current, {
+        ...baseChartOpts(true),
+        rightPriceScale: {
+          borderColor:  'rgba(255,255,255,0.06)',
+          scaleMargins: { top: 0.1, bottom: 0.1 },
+          minimumWidth: 60,
+        },
+      })
+      const mh = macdChart_.addHistogramSeries({ priceFormat: { type: 'price', precision: 2 }, priceLineVisible: false, lastValueVisible: false })
+      const ml = macdChart_.addLineSeries({ color: '#60a5fa', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'MACD' })
+      const ms = macdChart_.addLineSeries({ color: '#f97316', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'Signal' })
+      macdChart_.addLineSeries({ color: '#475569', lineWidth: 1, priceLineVisible: false, lastValueVisible: false })
+        .createPriceLine({ price: 0, color: '#475569', lineWidth: 1, lineStyle: LineStyle.Solid, axisLabelVisible: false, title: '' })
+
+      // Store refs
+      mainChart.current = mc; candleSeries.current = cs; volSeries.current = vs
+      ema21Series.current = e21; ema50Series.current = e50
+      rsiChart.current = rc; rsiSeries.current = rsiS
+      macdChart.current = macdChart_; macdHistSeries.current = mh; macdLineSeries.current = ml; macdSigSeries.current = ms
+
+      // ── Sync time ranges ──
+      mc.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        if (!range) return
+        rc.timeScale().setVisibleLogicalRange(range)
+        macdChart_.timeScale().setVisibleLogicalRange(range)
+      })
+      rc.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        if (!range) return
+        mc.timeScale().setVisibleLogicalRange(range)
+        macdChart_.timeScale().setVisibleLogicalRange(range)
+      })
+      macdChart_.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        if (!range) return
+        mc.timeScale().setVisibleLogicalRange(range)
+        rc.timeScale().setVisibleLogicalRange(range)
+      })
+
+      // ── Sync crosshair ──
+      mc.subscribeCrosshairMove((p) => {
+        if (p.time) {
+          rc.setCrosshairPosition(NaN, p.time, rsiS)
+          macdChart_.setCrosshairPosition(NaN, p.time, mh)
+        } else {
+          rc.clearCrosshairPosition()
+          macdChart_.clearCrosshairPosition()
         }
-      },
-    })
+      })
 
-    const vs = mc.addHistogramSeries({
-      color: '#60a5fa', priceFormat: { type: 'volume' }, priceScaleId: 'vol',
-    })
-    mc.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
-
-    const e21 = mc.addLineSeries({ color: '#f97316', lineWidth: 1, title: 'EMA21', priceLineVisible: false, lastValueVisible: true  })
-    const e50 = mc.addLineSeries({ color: '#a855f7', lineWidth: 1, title: 'EMA50', priceLineVisible: false, lastValueVisible: true  })
-
-    // ── RSI chart ──
-    const rc = createChart(rsiRef.current, {
-      ...baseChartOpts(false),
-      rightPriceScale: {
-        borderColor:  'rgba(255,255,255,0.06)',
-        scaleMargins: { top: 0.1, bottom: 0.1 },
-        minimumWidth: 60,
-      },
-    })
-    const rsiS = rc.addLineSeries({ color: '#60a5fa', lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
-    // Overbought / Oversold / Midline reference
-    ;[{ p: 70, c: '#ef4444', t: 'OB' }, { p: 50, c: '#475569', t: '' }, { p: 30, c: '#22c55e', t: 'OS' }]
-      .forEach(({ p, c, t }) =>
-        rsiS.createPriceLine({ price: p, color: c, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: !!t, title: t })
-      )
-
-    // ── MACD chart ──
-    const macd = createChart(macdRef.current, {
-      ...baseChartOpts(true),
-      rightPriceScale: {
-        borderColor:  'rgba(255,255,255,0.06)',
-        scaleMargins: { top: 0.1, bottom: 0.1 },
-        minimumWidth: 60,
-      },
-    })
-    const mh = macd.addHistogramSeries({ priceFormat: { type: 'price', precision: 2 }, priceLineVisible: false, lastValueVisible: false })
-    const ml = macd.addLineSeries({ color: '#60a5fa', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'MACD' })
-    const ms = macd.addLineSeries({ color: '#f97316', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: 'Signal' })
-    macd.addLineSeries({ color: '#475569', lineWidth: 1, priceLineVisible: false, lastValueVisible: false })
-      .createPriceLine({ price: 0, color: '#475569', lineWidth: 1, lineStyle: LineStyle.Solid, axisLabelVisible: false, title: '' })
-
-    // Store refs
-    mainChart.current = mc; candleSeries.current = cs; volSeries.current = vs
-    ema21Series.current = e21; ema50Series.current = e50
-    rsiChart.current = rc; rsiSeries.current = rsiS
-    macdChart.current = macd; macdHistSeries.current = mh; macdLineSeries.current = ml; macdSigSeries.current = ms
-
-    // ── Sync time ranges ──
-    mc.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-      if (!range) return
-      rc.timeScale().setVisibleLogicalRange(range)
-      macd.timeScale().setVisibleLogicalRange(range)
-    })
-    rc.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-      if (!range) return
-      mc.timeScale().setVisibleLogicalRange(range)
-      macd.timeScale().setVisibleLogicalRange(range)
-    })
-    macd.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-      if (!range) return
-      mc.timeScale().setVisibleLogicalRange(range)
-      rc.timeScale().setVisibleLogicalRange(range)
-    })
-
-    // ── Sync crosshair ──
-    mc.subscribeCrosshairMove((p) => {
-      if (p.time) {
-        rc.setCrosshairPosition(NaN, p.time, rsiS)
-        macd.setCrosshairPosition(NaN, p.time, mh)
-      } else {
-        rc.clearCrosshairPosition()
-        macd.clearCrosshairPosition()
+      // ── Resize observers ──
+      const mkRo = (el: HTMLDivElement, chart: IChartApi) => {
+        const ro = new ResizeObserver(() => {
+          const w = el.clientWidth
+          if (w > 0) chart.applyOptions({ width: w })
+        })
+        ro.observe(el)
+        return ro
       }
-    })
+      const ro1 = mkRo(mainRef.current!, mc)
+      const ro2 = mkRo(rsiRef.current!,  rc)
+      const ro3 = mkRo(macdRef.current!, macdChart_)
 
-    // ── Resize observers ──
-    const mkRo = (el: HTMLDivElement, chart: IChartApi) => {
-      const ro = new ResizeObserver(() => chart.applyOptions({ width: el.clientWidth }))
-      ro.observe(el)
-      return ro
+      setChartReady(true)
+
+      cleanup = () => {
+        ro1.disconnect(); ro2.disconnect(); ro3.disconnect()
+        try { mc.remove() } catch {}
+        try { rc.remove() } catch {}
+        try { macdChart_.remove() } catch {}
+        mainChart.current = rsiChart.current = macdChart.current = null
+        candleSeries.current = volSeries.current = null
+        ema21Series.current = ema50Series.current = null
+        rsiSeries.current = null
+        macdHistSeries.current = macdLineSeries.current = macdSigSeries.current = null
+        priceLines.current = []
+        setChartReady(false)
+      }
+    } catch (err) {
+      console.error('StockChart init error:', err)
     }
-    const ro1 = mkRo(mainRef.current, mc)
-    const ro2 = mkRo(rsiRef.current,  rc)
-    const ro3 = mkRo(macdRef.current, macd)
 
-    setChartReady(true)
-
-    return () => {
-      ro1.disconnect(); ro2.disconnect(); ro3.disconnect()
-      mc.remove(); rc.remove(); macd.remove()
-      mainChart.current = rsiChart.current = macdChart.current = null
-      candleSeries.current = volSeries.current = null
-      ema21Series.current = ema50Series.current = null
-      rsiSeries.current = null
-      macdHistSeries.current = macdLineSeries.current = macdSigSeries.current = null
-      priceLines.current = []
-      setChartReady(false)
-    }
+    return () => cleanup?.()
   }, [])
 
   // ── Load & compute indicators whenever data / timeframe changes ─────────────
