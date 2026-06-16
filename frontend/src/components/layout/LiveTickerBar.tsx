@@ -11,14 +11,15 @@ import { cn } from '@/lib/utils'
 // ── Live price ticker ─────────────────────────────────────────────────────────
 
 function PriceTick({ quote }: { quote: Quote }) {
-  const isUp = quote.change_pct >= 0
+  const changePct = quote.change_pct ?? 0
+  const isUp = changePct >= 0
   return (
     <span className="inline-flex items-center gap-1.5 px-3 border-r border-border/40 whitespace-nowrap">
       <span className="font-semibold text-xs">{quote.symbol}</span>
-      <span className="num text-xs">₹{quote.ltp.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
+      <span className="num text-xs">₹{(quote.ltp ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
       <span className={cn('num text-[10px] flex items-center gap-0.5', isUp ? 'text-green-400' : 'text-red-400')}>
         {isUp ? <TrendingUp className="w-2.5 h-2.5" /> : <TrendingDown className="w-2.5 h-2.5" />}
-        {isUp ? '+' : ''}{quote.change_pct.toFixed(2)}%
+        {isUp ? '+' : ''}{changePct.toFixed(2)}%
       </span>
     </span>
   )

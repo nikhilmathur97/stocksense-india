@@ -83,7 +83,7 @@ export default function StockDetailPage() {
             <p className="num text-3xl font-bold">₹{formatPrice(quote.ltp)}</p>
             <p className={cn('num text-sm font-semibold flex items-center justify-end gap-1 mt-0.5', isPositive ? 'text-green-400' : 'text-red-400')}>
               {isPositive ? <ArrowUp className="w-3.5 h-3.5" /> : <ArrowDown className="w-3.5 h-3.5" />}
-              ₹{formatPrice(Math.abs(quote.change))}&nbsp;({isPositive ? '+' : ''}{quote.change_pct.toFixed(2)}%)
+              ₹{formatPrice(Math.abs(quote.change ?? 0))}&nbsp;({isPositive ? '+' : ''}{(quote.change_pct ?? 0).toFixed(2)}%)
             </p>
           </div>
         ) : (

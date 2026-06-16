@@ -203,20 +203,27 @@ export function StockChart({ symbol, signal }: Props) {
       borderUpColor: '#22c55e', borderDownColor: '#ef4444',
       wickUpColor:   '#22c55e', wickDownColor:   '#ef4444',
       autoscaleInfoProvider: (original: () => AutoscaleInfo | null) => {
-        const base = original()
-        const sig  = signalRef.current
-        if (!sig) return base
-        const prices = [sig.stop_loss, sig.entry_price, sig.target_3d, sig.target_7d]
-          .filter((p): p is number => !!p)
-        if (!prices.length) return base
-        const mn = Math.min(...prices), mx = Math.max(...prices)
-        if (!base) return { priceRange: { minValue: mn, maxValue: mx }, margins: { above: 0.1, below: 0.1 } }
-        return {
-          priceRange: {
-            minValue: Math.min(base.priceRange.minValue, mn),
-            maxValue: Math.max(base.priceRange.maxValue, mx),
-          },
-          margins: base.margins,
+        try {
+          const base = original()
+          const sig  = signalRef.current
+          if (!sig) return base
+          const prices = [sig.stop_loss, sig.entry_price, sig.target_3d, sig.target_7d]
+            .filter((p): p is number => typeof p === 'number' && p > 0)
+          if (!prices.length) return base
+          const mn = Math.min(...prices), mx = Math.max(...prices)
+          // base may be null (empty series) or have a null priceRange
+          if (!base || !base.priceRange) {
+            return { priceRange: { minValue: mn, maxValue: mx }, margins: { above: 0.1, below: 0.1 } }
+          }
+          return {
+            priceRange: {
+              minValue: Math.min(base.priceRange.minValue, mn),
+              maxValue: Math.max(base.priceRange.maxValue, mx),
+            },
+            margins: base.margins,
+          }
+        } catch {
+          return null
         }
       },
     })
@@ -321,16 +328,30 @@ export function StockChart({ symbol, signal }: Props) {
 
   // ── Load & compute indicators whenever data / timeframe changes ─────────────
   useEffect(() => {
-    if (!chartReady || !data?.candles) return
+    if (!chartReady || !data?.candles?.length) return
     if (!candleSeries.current || !volSeries.current) return
     if (!ema21Series.current || !ema50Series.current) return
     if (!rsiSeries.current || !macdHistSeries.current) return
 
+    try {
     const cutoff = Date.now() - tf.showDays * 24 * 60 * 60 * 1000
     const toTime  = tf.intraday ? intradayTime : dailyTime
 
     // Sort ALL candles for indicator accuracy (EMAs need full history)
-    const all = [...data.candles].sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime())
+    // Deduplicate by rounded time to prevent lightweight-charts "time duplication" error
+    const seen = new Set<string>()
+    const all = [...data.candles]
+      .filter((c) => {
+        // Drop candles with invalid OHLCV data
+        if (!c.time || !c.close || !c.open || !c.high || !c.low) return false
+        // Deduplicate by time key
+        const key = toTime(c.time).toString()
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime())
+    if (!all.length) return
     const closes = all.map((c) => c.close)
 
     // Compute indicators on full history
@@ -375,6 +396,9 @@ export function StockChart({ symbol, signal }: Props) {
     mainChart.current?.timeScale().fitContent()
     rsiChart.current?.timeScale().fitContent()
     macdChart.current?.timeScale().fitContent()
+    } catch (err) {
+      console.error('StockChart data error:', err)
+    }
   }, [chartReady, data, tf.interval, tf.intraday, tf.showDays])
 
   // ── Signal price lines ──────────────────────────────────────────────────────
