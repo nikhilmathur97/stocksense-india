@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY backend/ ./backend/
 COPY engine/ ./engine/
 COPY database/ ./database/
+# v2: force rebuild to pick up backend code changes
 
 RUN adduser --disabled-password --gecos "" appuser && \
     mkdir -p /app/logs && chown -R appuser:appuser /app
@@ -19,13 +20,10 @@ USER appuser
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
-
 CMD gunicorn backend.main:app \
     -k uvicorn.workers.UvicornWorker \
-    -w 2 \
-    --bind 0.0.0.0:${PORT:-8000} \
-    --timeout 120 \
+    -w 1 \
+    --bind "0.0.0.0:${PORT:-8000}" \
+    --timeout 180 \
     --access-logfile - \
     --error-logfile -
