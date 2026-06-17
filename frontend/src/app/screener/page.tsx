@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Zap, RefreshCw, Clock, History, TrendingUp, TrendingDown } from 'lucide-react'
 import { screenerApi, type BacktestCalibration } from '@/lib/api'
@@ -8,6 +8,7 @@ import { SignalCard } from '@/components/screener/SignalCard'
 import { ScreenerFilters } from '@/components/screener/ScreenerFilters'
 import { useScreenerStore } from '@/store'
 import { cn } from '@/lib/utils'
+import { stockWS } from '@/lib/websocket'
 import toast from 'react-hot-toast'
 
 const REFETCH_INTERVAL_MS = 60_000
@@ -17,6 +18,8 @@ export default function ScreenerPage() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [countdown, setCountdown] = useState(REFETCH_INTERVAL_MS / 1000)
   const [isCalibrating, setIsCalibrating] = useState(false)
+  const [liveQuotes, setLiveQuotes] = useState<Record<string, { ltp: number; change_pct: number }>>({})
+  const liveQuotesRef = useRef<Record<string, { ltp: number; change_pct: number }>>({})
 
   const { data, isLoading, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['screenerSignals', filters],
@@ -57,6 +60,35 @@ export default function ScreenerPage() {
   useEffect(() => {
     if (data) setSignals(data)
   }, [data, setSignals])
+
+  // Subscribe to live WebSocket ticks for all visible signals
+  useEffect(() => {
+    const signals = data || []
+    if (!signals.length) return
+    const symbols = signals.map((s) => s.symbol)
+    stockWS.connect()
+    const handler = (tick: Record<string, unknown>) => {
+      const sym = tick.symbol as string
+      const ltp = tick.ltp as number
+      const change_pct = tick.change_pct as number
+      if (sym && ltp > 0) {
+        liveQuotesRef.current[sym] = { ltp, change_pct }
+      }
+    }
+    stockWS.subscribe(symbols, handler)
+    return () => stockWS.unsubscribe(symbols, handler)
+  }, [data])
+
+  // Flush batched ticks to state every 2 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const snap = liveQuotesRef.current
+      if (Object.keys(snap).length > 0) {
+        setLiveQuotes({ ...snap })
+      }
+    }, 2000)
+    return () => clearInterval(interval)
+  }, [])
 
   const handleRunScreener = useCallback(async () => {
     const t = toast.loading('Running AI screener… (30–60s)', { duration: 120_000 })
@@ -220,7 +252,7 @@ export default function ScreenerPage() {
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
           {signals.map((sig) => (
-            <SignalCard key={`${sig.symbol}-${sig.exchange}`} signal={sig} />
+            <SignalCard key={`${sig.symbol}-${sig.exchange}`} signal={sig} liveQuote={liveQuotes[sig.symbol]} />
           ))}
         </div>
       )}

@@ -55,12 +55,18 @@ export default function DashboardPage() {
     return () => stockWS.disconnect()
   }, [])
 
-  // Subscribe to trending symbols when they load
+  // Subscribe to trending + top-pick symbols when they load
   useEffect(() => {
     if (trending && trending.length > 0) {
       stockWS.subscribe(trending.map((q) => q.symbol), () => {})
     }
   }, [trending?.length])
+
+  useEffect(() => {
+    if (topPicks && topPicks.length > 0) {
+      stockWS.subscribe(topPicks.map((s) => s.symbol), () => {})
+    }
+  }, [topPicks?.length])
 
   // ── Merge live ticks into trending data ───────────────────────────────────
   const liveQuotes = trending?.map((q) => {
@@ -330,7 +336,14 @@ export default function DashboardPage() {
               ))
             : displayPicks.length > 0
               ? displayPicks.slice(0, 8).map((sig) => (
-                  <SignalCard key={sig.symbol} signal={sig} />
+                  <SignalCard
+                    key={sig.symbol}
+                    signal={sig}
+                    liveQuote={ticks[sig.symbol]
+                      ? { ltp: ticks[sig.symbol].ltp, change_pct: ticks[sig.symbol].change_pct }
+                      : undefined
+                    }
+                  />
                 ))
               : (
                 <div className="col-span-4 glass rounded-xl p-6 text-center">

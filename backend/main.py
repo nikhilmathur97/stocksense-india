@@ -105,15 +105,19 @@ async def lifespan(app: FastAPI):
             async def _poll_quotes():
                 import asyncio as _asyncio, json as _json
                 from datetime import datetime as _dt
-                from backend.data_fetcher import get_smart_api
+                from backend.data_fetcher import get_smart_api, _session as _angel_session
                 redis_client = await get_redis()
 
                 token_to_symbol = {dict(s)["symbol_token"]: dict(s)["symbol"] for s in stocks if dict(s).get("symbol_token")}
                 all_tokens = list(token_to_symbol.keys())
 
+                _consecutive_errors = 0
+                _last_success_log = 0
+
                 while True:
                     try:
                         api = get_smart_api()
+                        _batch_ok = 0
                         # Fetch all tokens in batches of 50 (Angel One limit)
                         for i in range(0, len(all_tokens), 50):
                             batch = all_tokens[i:i+50]
@@ -151,13 +155,35 @@ async def lifespan(app: FastAPI):
                                         "timestamp": _dt.now().isoformat(),
                                     }
                                     # Cache with 30s TTL (refreshed every 2s by poll loop)
-                                    # 30s prevents expiry gaps when screener/other endpoints read quotes
                                     await redis_client.setex(f"quote:NSE:{sym}", 30, _json.dumps(q))
                                     # Publish to frontend WebSocket for instant push
                                     await redis_client.publish("live:ticks", _json.dumps(q))
+                                    _batch_ok += 1
                             await _asyncio.sleep(0.1)  # small gap between batches
+
+                        if _batch_ok > 0:
+                            _consecutive_errors = 0
+                            now = _dt.now().timestamp()
+                            if now - _last_success_log > 300:  # log success every 5 min
+                                logger.info(f"Quote poll: {_batch_ok} quotes cached OK")
+                                _last_success_log = now
+                        else:
+                            _consecutive_errors += 1
+                            logger.warning(f"Quote poll: 0 quotes fetched (attempt {_consecutive_errors})")
+
                     except Exception as ex:
-                        logger.debug(f"Quote poll error: {ex}")
+                        _consecutive_errors += 1
+                        logger.warning(f"Quote poll error (attempt {_consecutive_errors}): {ex}")
+                        # After 3 consecutive failures, force Angel One re-login
+                        if _consecutive_errors >= 3:
+                            try:
+                                logger.warning("Quote poll: forcing Angel One re-login...")
+                                import asyncio as _asyncio2
+                                await _asyncio2.get_event_loop().run_in_executor(None, _angel_session.login)
+                                logger.info("Quote poll: Angel One re-login succeeded")
+                                _consecutive_errors = 0
+                            except Exception as login_ex:
+                                logger.error(f"Quote poll: Angel One re-login failed: {login_ex}")
                     await _asyncio.sleep(2)  # poll every 2s for near-real-time updates
 
             # Auto-screener — runs every 1 min during market hours (9:15–15:30 IST)
@@ -486,6 +512,30 @@ async def detailed_health():
         content={"status": "ok" if all_ok else "degraded", "checks": checks},
         status_code=200 if all_ok else 503,
     )
+
+
+# ── Quote cache diagnostic ────────────────────────────────────────────────────
+@app.get("/api/debug/quotes", tags=["Health"])
+async def debug_quotes():
+    """Check how many live Redis quote keys exist and show a sample."""
+    import json as _json
+    redis = await get_redis()
+    keys = await redis.keys("quote:NSE:*")
+    sample = {}
+    for k in keys[:5]:
+        raw = await redis.get(k)
+        if raw:
+            try:
+                q = _json.loads(raw)
+                sym = k.split(":")[-1]
+                sample[sym] = {"ltp": q.get("ltp"), "timestamp": q.get("timestamp")}
+            except Exception:
+                pass
+    return {
+        "live_quote_keys": len(keys),
+        "status": "live" if len(keys) > 0 else "empty — Angel One session likely expired",
+        "sample": sample,
+    }
 
 
 # ── Global Exception Handler ──────────────────────────────────────────────────

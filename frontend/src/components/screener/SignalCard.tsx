@@ -12,6 +12,7 @@ import type { StockSignal } from '@/lib/api'
 
 interface SignalCardProps {
   signal: StockSignal
+  liveQuote?: { ltp: number; change_pct: number }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -91,7 +92,7 @@ function signalAge(createdAt?: string): { label: string; isStale: boolean } {
   }
 }
 
-export function SignalCard({ signal }: SignalCardProps) {
+export function SignalCard({ signal, liveQuote }: SignalCardProps) {
   const [expanded, setExpanded] = useState(false)
 
   const probColor = probabilityColor(signal.probability_7d ?? signal.probability_score)
@@ -106,10 +107,10 @@ export function SignalCard({ signal }: SignalCardProps) {
   // Signal age
   const age = signalAge(signal.created_at)
 
-  // Live price from backend overlay (added by screener /top-picks endpoint)
-  const liveLtp = signal.live_ltp
-  const priceChangePct = signal.price_change_pct
-  const hasLivePrice = liveLtp != null && liveLtp > 0
+  // Live price: prefer real-time WebSocket tick, fall back to screener API overlay
+  const liveLtp = liveQuote?.ltp ?? signal.live_ltp
+  const priceChangePct = liveQuote?.change_pct ?? signal.price_change_pct
+  const hasLivePrice = (liveLtp ?? 0) > 0
 
   // Probability interpretation
   const probLabel =
