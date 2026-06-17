@@ -83,15 +83,16 @@ async def lifespan(app: FastAPI):
         db_url = os.getenv("DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://")
         pool = await asyncpg.create_pool(db_url, min_size=1, max_size=3)
         async with pool.acquire() as conn:
+            # Fetch ALL active stocks — tokens may be missing and will be populated dynamically
             stocks = await conn.fetch(
-                "SELECT symbol, symbol_token FROM stocks WHERE is_active=TRUE AND symbol_token IS NOT NULL AND symbol_token != ''"
+                "SELECT symbol, symbol_token FROM stocks WHERE is_active=TRUE"
             )
         await pool.close()
 
         tokens = [r["symbol_token"] for r in stocks if r["symbol_token"]]
+
+        # Angel One WebSocket — only startable when tokens exist in DB
         if tokens:
-            # Angel One WebSocket (blocking) — run in background thread
-            # exchangeType key (camelCase) required by SmartWebSocketV2
             token_groups = [{"exchangeType": 1, "tokens": tokens}]
             ws_thread = threading.Thread(
                 target=live_feed.connect,
@@ -100,27 +101,71 @@ async def lifespan(app: FastAPI):
             )
             ws_thread.start()
             logger.info(f"Angel One WebSocket feed started — {len(tokens)} stocks")
+        else:
+            logger.warning(
+                f"symbol_token missing for all {len(stocks)} stocks — "
+                "WebSocket feed skipped; REST poll will fetch tokens dynamically"
+            )
 
-            # REST poll — refreshes all quotes every 2s, publishes to frontend WebSocket
+        # Background loops — start as long as any stocks exist in DB
+        if stocks:
+            # ── REST quote poll — fetches tokens dynamically if DB has none ──
             async def _poll_quotes():
                 import asyncio as _asyncio, json as _json
                 from datetime import datetime as _dt
-                from backend.data_fetcher import get_smart_api, _session as _angel_session
+                from backend.data_fetcher import get_smart_api, _get_symbol_token, _session as _angel_session
                 redis_client = await get_redis()
+                loop = _asyncio.get_event_loop()
 
-                token_to_symbol = {dict(s)["symbol_token"]: dict(s)["symbol"] for s in stocks if dict(s).get("symbol_token")}
+                # Build token → symbol map from DB; fetch any missing ones via searchScrip
+                token_to_symbol: dict = {
+                    dict(s)["symbol_token"]: dict(s)["symbol"]
+                    for s in stocks if dict(s).get("symbol_token")
+                }
+                symbol_list = [dict(s)["symbol"] for s in stocks]
+
+                if not token_to_symbol:
+                    logger.warning(
+                        f"Fetching symbol tokens for {len(symbol_list)} stocks via Angel One searchScrip..."
+                    )
+                    for sym in symbol_list:
+                        try:
+                            tok = await loop.run_in_executor(None, _get_symbol_token, sym, "NSE")
+                            if tok:
+                                token_to_symbol[tok] = sym
+                        except Exception:
+                            pass
+                    logger.info(
+                        f"Token population done: {len(token_to_symbol)}/{len(symbol_list)} resolved"
+                    )
+                    # Persist fetched tokens back to DB so next restart is instant
+                    try:
+                        from backend.database import get_db as _get_db
+                        async for _db in _get_db():
+                            for tok, sym in token_to_symbol.items():
+                                await _db.execute(
+                                    _text("UPDATE stocks SET symbol_token = :t WHERE symbol = :s AND (symbol_token IS NULL OR symbol_token = '')"),
+                                    {"t": tok, "s": sym},
+                                )
+                            await _db.commit()
+                            logger.info("symbol_token values written back to DB")
+                            break
+                    except Exception as _dbe:
+                        logger.warning(f"Could not persist tokens to DB: {_dbe}")
+
                 all_tokens = list(token_to_symbol.keys())
-
                 _consecutive_errors = 0
-                _last_success_log = 0
+                _last_success_log = 0.0
 
                 while True:
                     try:
+                        if not all_tokens:
+                            await _asyncio.sleep(10)
+                            continue
                         api = get_smart_api()
                         _batch_ok = 0
-                        # Fetch all tokens in batches of 50 (Angel One limit)
                         for i in range(0, len(all_tokens), 50):
-                            batch = all_tokens[i:i+50]
+                            batch = all_tokens[i:i + 50]
                             data = api.getMarketData("FULL", {"NSE": batch})
                             if data and data.get("status") and data.get("data"):
                                 for item in data["data"].get("fetched", []):
@@ -131,13 +176,10 @@ async def lifespan(app: FastAPI):
                                     ltp = float(item.get("ltp", 0))
                                     if ltp <= 0:
                                         continue
-                                    # Angel One returns prev-day close in "close" field
                                     api_close = float(item.get("close", 0))
                                     prev = api_close if api_close > 0 else ltp
-                                    # Use Angel One's own netChange/percentChange (most accurate)
                                     net_change = float(item.get("netChange", 0))
                                     pct_change = float(item.get("percentChange", 0))
-                                    # Fallback computation if API returns 0
                                     if pct_change == 0 and prev > 0 and prev != ltp:
                                         net_change = round(ltp - prev, 2)
                                         pct_change = round(net_change / prev * 100, 2)
@@ -154,17 +196,15 @@ async def lifespan(app: FastAPI):
                                         "change_pct": pct_change,
                                         "timestamp": _dt.now().isoformat(),
                                     }
-                                    # Cache with 30s TTL (refreshed every 2s by poll loop)
                                     await redis_client.setex(f"quote:NSE:{sym}", 30, _json.dumps(q))
-                                    # Publish to frontend WebSocket for instant push
                                     await redis_client.publish("live:ticks", _json.dumps(q))
                                     _batch_ok += 1
-                            await _asyncio.sleep(0.1)  # small gap between batches
+                            await _asyncio.sleep(0.1)
 
                         if _batch_ok > 0:
                             _consecutive_errors = 0
                             now = _dt.now().timestamp()
-                            if now - _last_success_log > 300:  # log success every 5 min
+                            if now - _last_success_log > 300:
                                 logger.info(f"Quote poll: {_batch_ok} quotes cached OK")
                                 _last_success_log = now
                         else:
@@ -174,29 +214,22 @@ async def lifespan(app: FastAPI):
                     except Exception as ex:
                         _consecutive_errors += 1
                         logger.warning(f"Quote poll error (attempt {_consecutive_errors}): {ex}")
-                        # After 3 consecutive failures, force Angel One re-login
                         if _consecutive_errors >= 3:
                             try:
                                 logger.warning("Quote poll: forcing Angel One re-login...")
-                                import asyncio as _asyncio2
-                                await _asyncio2.get_event_loop().run_in_executor(None, _angel_session.login)
+                                await loop.run_in_executor(None, _angel_session.login)
                                 logger.info("Quote poll: Angel One re-login succeeded")
                                 _consecutive_errors = 0
                             except Exception as login_ex:
                                 logger.error(f"Quote poll: Angel One re-login failed: {login_ex}")
-                    await _asyncio.sleep(2)  # poll every 2s for near-real-time updates
+                    await _asyncio.sleep(2)
 
-            # Auto-screener — runs every 1 min during market hours (9:15–15:30 IST)
-            # WHY NOT EVERY SECOND: Screener reads 200 OHLCV candles per stock from
-            # PostgreSQL, calculates 15+ indicators, and scores all 68 stocks.
-            # A new 1-min candle forms every 60s — running more often gives identical
-            # results but hammers the DB (68 queries/sec → crash).
-            # PRICES update every 1-2s via the poll loop + WebSocket above.
+            # ── Auto-screener — 1 min during market hours ──────────────────
             async def _auto_screener():
                 import asyncio as _asyncio
                 from datetime import datetime as _dt, timedelta as _td, timezone as _tz, time as _time
                 _IST_OFFSET = _td(hours=5, minutes=30)
-                _SCREENER_INTERVAL = 60  # 1 minute — matches 1-min candle formation rate
+                _SCREENER_INTERVAL = 60
                 _MARKET_OPEN  = _time(9, 15)
                 _MARKET_CLOSE = _time(15, 30)
 
@@ -207,7 +240,6 @@ async def lifespan(app: FastAPI):
                 async def _run_once():
                     try:
                         import json as _json
-                        from decimal import Decimal as _Decimal
                         from engine.screener import run_screener as _run_screener
                         from backend.database import get_db as _get_db
                         from backend.routers.paper_trades import auto_enter_paper_trades as _auto_pt
@@ -215,13 +247,10 @@ async def lifespan(app: FastAPI):
                         results = await _run_screener()
                         high_conf = [r for r in results if r.get("probability_score", 0) >= 80]
 
-                        # Persist signals to DB (same as manual /run endpoint)
                         if results:
                             async for _db in _get_db():
                                 try:
-                                    await _db.execute(_text(
-                                        "UPDATE stock_signals SET is_active = FALSE"
-                                    ))
+                                    await _db.execute(_text("UPDATE stock_signals SET is_active = FALSE"))
                                     for s in results:
                                         await _db.execute(_text("""
                                             INSERT INTO stock_signals (
@@ -283,15 +312,11 @@ async def lifespan(app: FastAPI):
                                             "price_action_score": s.get("price_action_score"),
                                             "options_score": s.get("options_score"),
                                             "reasoning": s.get("reasoning"),
-                                            "confirmation_checks": _json.dumps(
-                                                s.get("confirmation_checks") or {}
-                                            ),
+                                            "confirmation_checks": _json.dumps(s.get("confirmation_checks") or {}),
                                             "confirmed_count": s.get("confirmed_count", 0),
                                             "buy_confirmed": bool(s.get("buy_confirmed", False)),
                                         })
                                     await _db.commit()
-
-                                    # Auto-enter paper trades for qualifying signals
                                     entered = await _auto_pt(results, _db)
                                     if entered:
                                         logger.info(f"📊 Auto paper trades: {entered} new position(s) opened")
@@ -299,24 +324,17 @@ async def lifespan(app: FastAPI):
                                     logger.error(f"Auto-screener DB save error: {_db_err}")
                                 break
 
-                        logger.info(
-                            f"✅ Auto-screener done: {len(results)} signals, "
-                            f"{len(high_conf)} HIGH confidence (≥80%)"
-                        )
-                        redis_client = await get_redis()
-                        await redis_client.delete("screener:top_picks")
-                        await redis_client.delete("screener:results")
+                        logger.info(f"✅ Auto-screener done: {len(results)} signals, {len(high_conf)} HIGH confidence (≥80%)")
+                        _rc = await get_redis()
+                        await _rc.delete("screener:top_picks")
+                        await _rc.delete("screener:results")
                     except Exception as se:
                         logger.error(f"Auto-screener run error: {se}")
 
-                # Wait for DB + Angel One feed to settle
                 await _asyncio.sleep(10)
-
-                # Run immediately at startup if market is open
                 if _is_market_hours():
                     logger.info("⏰ Auto-screener: startup run (market is open)...")
                     await _run_once()
-
                 while True:
                     await _asyncio.sleep(_SCREENER_INTERVAL)
                     try:
@@ -325,30 +343,25 @@ async def lifespan(app: FastAPI):
                             await _run_once()
                         else:
                             now_ist = _dt.now(_tz.utc) + _IST_OFFSET
-                            logger.debug(
-                                f"⏸ Auto-screener: market closed "
-                                f"(IST {now_ist.strftime('%H:%M')}) — skipping"
-                            )
+                            logger.debug(f"⏸ Auto-screener: market closed (IST {now_ist.strftime('%H:%M')}) — skipping")
                     except Exception as ex:
                         logger.error(f"Auto-screener loop error: {ex}")
 
-            # News fetch loop — runs every 60 s, 24/7 (news is not market-hours-only)
+            # ── News loop — 60 s, 24/7 ────────────────────────────────────
             async def _news_loop():
                 import asyncio as _asyncio
                 import json as _json
                 from backend.routers.news import fetch_all_news as _fetch_news
-                # Initial fetch after a short delay
                 await _asyncio.sleep(5)
                 while True:
                     try:
                         items = await _fetch_news()
                         if items:
-                            redis_client_sync = await get_redis()
-                            await redis_client_sync.setex("news:all", 60, _json.dumps(items))
-                            # Publish breaking news to WebSocket clients
+                            _rc = await get_redis()
+                            await _rc.setex("news:all", 60, _json.dumps(items))
                             breaking = [i for i in items if i.get("is_breaking")]
                             for item in breaking[:3]:
-                                await redis_client_sync.publish("news:breaking", _json.dumps({
+                                await _rc.publish("news:breaking", _json.dumps({
                                     "type": "news",
                                     "title": item["title"],
                                     "summary": item["summary"],
@@ -365,7 +378,7 @@ async def lifespan(app: FastAPI):
                         logger.debug(f"News loop error: {_ne}")
                     await _asyncio.sleep(60)
 
-            # Paper trade price monitor — checks open trades every 5 min during market hours
+            # ── Paper trade monitor — 5 min during market hours ───────────
             async def _paper_trade_monitor():
                 import asyncio as _asyncio
                 from datetime import datetime as _dt, timedelta as _td, timezone as _tz, time as _time
@@ -374,11 +387,10 @@ async def lifespan(app: FastAPI):
                 _IST = _td(hours=5, minutes=30)
                 _OPEN  = _time(9, 15)
                 _CLOSE = _time(15, 35)
-                await _asyncio.sleep(30)   # let DB settle before first check
+                await _asyncio.sleep(30)
                 while True:
                     now_ist = (_dt.now(_tz.utc) + _IST).time()
-                    is_mkt = _OPEN <= now_ist <= _CLOSE
-                    if is_mkt:
+                    if _OPEN <= now_ist <= _CLOSE:
                         try:
                             _rc = await get_redis()
                             async for _db in _get_db():
@@ -388,7 +400,7 @@ async def lifespan(app: FastAPI):
                                 break
                         except Exception as _me:
                             logger.error(f"Paper trade monitor error: {_me}")
-                    await _asyncio.sleep(300)   # every 5 minutes
+                    await _asyncio.sleep(300)
 
             import asyncio as _asyncio
             _asyncio.ensure_future(_poll_quotes())
@@ -400,7 +412,7 @@ async def lifespan(app: FastAPI):
             logger.info("News loop started — fetches from 8 sources every 60 s, 24/7")
             logger.info("Paper trade monitor started — checks open trades every 5 min during market hours")
 
-            # Start Alert Engine — monitors live quotes and fires alerts
+            # Alert Engine
             try:
                 from backend.services.alert_engine import AlertEngine, set_alert_engine
                 _redis_for_alerts = await get_redis()
@@ -411,7 +423,7 @@ async def lifespan(app: FastAPI):
             except Exception as ae_err:
                 logger.warning(f"Alert engine start failed: {ae_err}")
         else:
-            logger.warning("No stock tokens found — WebSocket feed not started")
+            logger.warning("No active stocks in DB — feed not started")
     except Exception as e:
         logger.warning(f"WebSocket feed skipped: {e}")
 
